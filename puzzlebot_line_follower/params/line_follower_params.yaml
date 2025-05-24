@@ -1,0 +1,23 @@
+line_light_detector:
+  ros__parameters:
+    vision:
+      image_topic: "/video_source/raw"
+      # Baja este valor para alargar el trapecio hacia arriba:
+      roi_y_start:    0.5   # antes 0.75, ahora cubre el 50% inferior
+      trap_top_ratio: 0.9
+      morph_iter:     1
+
+
+line_follower_controller:
+  ros__parameters:
+    control:
+      speed:
+        default: 0.07
+      pid:
+        Kp: 1.0
+        Ki: 0.0
+        Kd: 0.0
+      max_v: 0.3
+      min_v: 0.0
+      max_w: 0.5
+      min_w: 0.05
