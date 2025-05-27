@@ -1,0 +1,40 @@
+line_light_detector:
+  ros__parameters:
+    image_topic:        '/video_source/raw'
+    roi_y_start:         0.2
+    x_crop_ratio:        0.2
+    morph_kernel_size:   3
+    morph_iterations:    2
+    use_clahe:          true
+    bottom_tolerance:    2
+
+    # ---- Parámetros de Kalman, aplanados ----
+    kalman.dt:           0.013
+    kalman.Q:            [0.01, 0.0, 0.0, 0.1]  # se interpreta como matriz 2×2 en fila mayor
+    kalman.R:            0.005
+    kalman.P0:           [1.0, 0.0, 0.0, 1.0]  # matriz 2×2 inicial
+
+yolov8_detector:
+  ros__parameters:
+    model_path:            '/home/jp/ros2_ws_2/src/puzzlebot_line_follower/models/lastfinal.pt'
+    image_topic:           '/video_source/raw'
+    confidence_threshold:   0.6
+    inference_topic:       '/yolov8/inference'
+    annotated_image_topic: '/inference_result'
+
+# params/line_follower_params.yaml
+
+line_follower_controller:
+  ros__parameters:
+    control.error_topic:    '/line_detector/error'
+    control.cmd_vel_topic:  '/cmd_vel'
+    control.loop_hz:         30.0
+    control.speed.default:   0.16
+    control.pid.Kp:          0.7
+    control.pid.Ki:          0.007
+    control.pid.Kd:          0.08
+    control.max_v:           0.23
+    control.min_v:           0.03
+    control.max_w:            0.7
+    control.error_deadzone:   0.0
+
