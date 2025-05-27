@@ -1,155 +1,133 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32
 from cv_bridge import CvBridge
-
 import cv2
 import numpy as np
 
 class LineLightDetector(Node):
     def __init__(self):
         super().__init__('line_light_detector')
-        self.bridge = CvBridge()
+        # parámetros
+        self.declare_parameter('image_topic',      '/video_source/raw')
+        self.declare_parameter('roi_y_start',       0.4)
+        self.declare_parameter('trap_top_ratio',    0.9)  # declarado pero no usado en recorte
+        self.declare_parameter('x_crop_ratio',      0.2)
+        self.declare_parameter('morph_kernel_size', 3)
+        self.declare_parameter('morph_iterations',  2)
+        self.declare_parameter('use_clahe',        True)
+        self.declare_parameter('bottom_tolerance',  2)
 
-        # Parámetros de visión
-        self.declare_parameter('vision.image_topic', '/video_source/raw')
-        self.declare_parameter('vision.roi_y_start', 0.4)
-        self.declare_parameter('vision.trap_top_ratio', 0.9)
-        self.declare_parameter('vision.morph_iter', 2)
+        # publishers & bridge
+        self.pub_error = self.create_publisher(Float32, '/line_detector/error', 10)
+        self.pub_debug = self.create_publisher(Image,    '/line_detector/debug_image', 10)
+        self.bridge    = CvBridge()
 
-        vp = self.get_parameter
-        self.image_topic    = vp('vision.image_topic').value
-        self.roi_y_start    = vp('vision.roi_y_start').value
-        self.trap_top_ratio = vp('vision.trap_top_ratio').value
-        self.morph_iter     = vp('vision.morph_iter').value
+        # suscripción al tópico de imagen
+        topic = self.get_parameter('image_topic').value
+        self.create_subscription(Image, topic, self.image_callback, 10)
+        self.get_logger().info(f'Subscrito a {topic}')
 
-        # CLAHE para contraste local
-        self.clahe = cv2.createCLAHE(clipLimit=2.45, tileGridSize=(7, 7))
-
-        # Suscripción al tópico de imagen
-        self.get_logger().info(f'Suscribiendo a imágenes en: {self.image_topic}')
-        self.create_subscription(
-            Image, self.image_topic, self.cb_image, 1)
-
-        # Publishers
-        self.roi_image_pub   = self.create_publisher(Image,   '/line_detector/roi_image',   1)
-        self.debug_image_pub = self.create_publisher(Image,   '/line_detector/debug_image', 1)
-        self.error_pub       = self.create_publisher(Float32, '/line_detector/error',       1)
-
-        self.get_logger().info('LineLightDetector iniciado y esperando imágenes...')
-
-    def cb_image(self, msg: Image):
-        # Convertir ROS Image a OpenCV BGR
+    def image_callback(self, msg: Image):
+        # 1) Convertir ROS Image → BGR y rotar 180°
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+        Hf, Wf = frame.shape[:2]
 
-        # Redimensionar para consistencia
-        target_width, target_height = 720, 480
-        frame = cv2.resize(frame, (target_width, target_height))
+        # 2) Recortar ROI rectangular (zona de la pista)
+        y0     = int(self.get_parameter('roi_y_start').value * Hf)
+        x_crop = int(self.get_parameter('x_crop_ratio').value * Wf)
+        roi     = frame[y0:Hf, x_crop:Wf - x_crop]
+        h, w    = roi.shape[:2]
 
-        # Recortar ROI inferior
-        h, w = frame.shape[:2]
-        y0 = int(h * self.roi_y_start)
-        roi = frame[y0:, :]
-        rh, rw = roi.shape[:2]
+        # 3) Escala de grises + blur + CLAHE opcional
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        if self.get_parameter('use_clahe').value:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray  = clahe.apply(gray)
 
-        # Publicar ROI cruda (opcional)
-        roi_msg = self.bridge.cv2_to_imgmsg(roi, encoding='bgr8')
-        roi_msg.header = msg.header
-        self.roi_image_pub.publish(roi_msg)
-
-        # Crear máscara trapezoidal
-        top_w = int(rw * self.trap_top_ratio)
-        trap = np.array([[
-            ((rw - top_w) // 2, 0),
-            ((rw + top_w) // 2, 0),
-            (rw, rh),
-            (0, rh)
-        ]], dtype=np.int32)
-        mask = np.zeros((rh, rw), dtype=np.uint8)
-        cv2.fillPoly(mask, trap, 255)
-        roi_masked = cv2.bitwise_and(roi, roi, mask=mask)
-
-        # Gris → CLAHE → blur
-        gray       = cv2.cvtColor(roi_masked, cv2.COLOR_BGR2GRAY)
-        gray_clahe = self.clahe.apply(gray)
-        blurred    = cv2.GaussianBlur(gray_clahe, (5, 5), 0)
-
-        # Umbral inverso Otsu
-        _, binary_inv = cv2.threshold(
-            blurred, 0, 255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        # Morfología
-        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
-        morph = cv2.erode(binary_inv, kern, iterations=self.morph_iter)
-        morph = cv2.dilate(morph, kern, iterations=self.morph_iter)
-
-        # Canny + recortes lateral y trapezoidal
-        edges = cv2.Canny(morph, 50, 150)
-        crop = int(rw * 0.05)
-        side_mask = np.zeros_like(edges)
-        cv2.rectangle(side_mask, (crop, 0), (rw - crop, rh), 255, -1)
-        edges = cv2.bitwise_and(edges, edges, mask=side_mask)
-        edges = cv2.bitwise_and(edges, edges, mask=mask)
-
-        # HoughLinesP
-        lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi/180,
-            threshold=50,
-            minLineLength=5,
-            maxLineGap=50
+        # 4) Binarización inversa Otsu + cierre morfológico
+        _, binary = cv2.threshold(
+            gray, 0, 255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+        ksize = self.get_parameter('morph_kernel_size').value
+        kernel = np.ones((ksize, ksize), np.uint8)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, kernel,
+            iterations=self.get_parameter('morph_iterations').value
         )
 
-        debug = roi.copy()
-        error = 0.0
+        # 5) Encontrar todos los contornos
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-        if lines is not None:
-            left_x_vals, right_x_vals, center_x_vals = [], [], []
-            for l in lines:
-                x1, y1, x2, y2 = l[0]
-                # Dibujar y clasificar por pendiente
-                slope = (y2 - y1) / (x2 - x1 + 1e-6)
-                mid_x = (x1 + x2) / 2.0
-                if abs(slope) < 0.3:
-                    center_x_vals.append(mid_x)
-                    color = (255, 255, 0)  # amarillo para central
-                elif slope < 0:
-                    left_x_vals.append(mid_x)
-                    color = (0, 0, 255)    # rojo para izquierda
-                else:
-                    right_x_vals.append(mid_x)
-                    color = (0, 255, 0)    # verde para derecha
-                cv2.line(debug, (x1, y1), (x2, y2), color, 2)
+        # 6) Filtrar contornos que “tocan” el fondo de la ROI
+        tol = self.get_parameter('bottom_tolerance').value
+        valid = []
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if y + ch >= h - tol:
+                valid.append(cnt)
 
-            # Fallback central → laterales
-            if center_x_vals:
-                target_x = sum(center_x_vals) / len(center_x_vals)
-            elif left_x_vals and right_x_vals:
-                left_x  = sum(left_x_vals)  / len(left_x_vals)
-                right_x = sum(right_x_vals) / len(right_x_vals)
-                target_x = (left_x + right_x) / 2.0
-            else:
-                target_x = rw / 2.0  # fallback al centro
+        # 7) Si no hay contornos válidos, publica error cero
+        if not valid:
+            self.pub_error.publish(Float32(data=0.0))
+            return
 
-            error = float(target_x - rw/2.0)
-            cv2.circle(debug, (int(target_x), rh//2), 5, (0, 255, 255), -1)
-            self.get_logger().info(f'Error carril: {error:.1f} px')
+        # 8) Calcular centroides de contornos válidos
+        centroids = []
+        for cnt in valid:
+            M = cv2.moments(cnt)
+            if M['m00'] == 0:
+                continue
+            cx = M['m10'] / M['m00']
+            centroids.append((cnt, cx))
 
-        # Publicar debug y error
-        dbg_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-        dbg_msg.header = msg.header
-        self.debug_image_pub.publish(dbg_msg)
-        self.error_pub.publish(Float32(data=error))
+        if not centroids:
+            self.pub_error.publish(Float32(data=0.0))
+            return
+
+        # 9) Seleccionar los dos centroides más cercanos al centro de la ROI
+        x_center = w / 2.0
+        centroids.sort(key=lambda c: abs(c[1] - x_center))
+        selected = centroids[:2]
+
+        # 10) Promediar sus coordenadas x para obtener el eje de la línea
+        avg_cx = sum(c[1] for c in selected) / len(selected)
+
+        # 11) Calcular error lateral normalizado y publicarlo
+        error_px   = x_center - avg_cx
+        error_norm = float(error_px) / x_center
+        self.pub_error.publish(Float32(data=error_norm))
+
+        # 12) Generar imagen de depuración
+        debug = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        for cnt, cx in selected:
+            cv2.drawContours(debug, [cnt], -1, (0,255,0), 2)
+            cv2.circle(debug, (int(cx), int(np.mean([cv2.boundingRect(cnt)[1]+cv2.boundingRect(cnt)[3] for cnt in [cnt]]))), 5, (0,0,255), -1)
+        # línea promedio y centro de imagen
+        cv2.line(debug, (int(avg_cx), 0), (int(avg_cx), h), (255,0,255), 2)
+        cv2.line(debug, (int(x_center), 0), (int(x_center), h), (255,0,0),    2)
+
+        debug_msg = self.bridge.cv2_to_imgmsg(debug, 'bgr8')
+        self.pub_debug.publish(debug_msg)
+
+    def destroy_node(self):
+        self.get_logger().info('Cerrando nodo')
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
     node = LineLightDetector()
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 
